@@ -41,6 +41,7 @@ class WrappedLlamav2Config(LlamaConfig):
 
     model_type = "wrapped_llamav2"
     mm_hidden_size: int = 4800  # size of the jukebox embeddings with temporal averaging
+    tune_mm_mlp_adapter: bool = False  # whether to tune the multimodal MLP adapter
 
 
 class WrappedLlamav2Model(LlamaModel):

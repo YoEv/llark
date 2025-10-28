@@ -133,6 +133,10 @@ def load_pretrained_model(
     ckpt_dir = os.path.join(model_name, f"checkpoint-{ckpt_num}")
 
     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+    
+    # Set pad_token if it doesn't exist (required for LLaMA tokenizer)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Determine whether the checkpoint is sharded or not.
     if os.path.exists(os.path.join(ckpt_dir, WEIGHTS_NAME)):
@@ -168,7 +172,7 @@ def load_pretrained_model(
             getattr(model, model_attr).audio_encoder_config.audio_end_token,
         ) = tokenizer.convert_tokens_to_ids([DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN])
 
-    elif "meta-llama/Llama-2" in model_name:
+    elif "meta-llama" in model_name or "Llama-2" in model_name:
         model = WrappedLlamav2ForCausalLM.from_pretrained(
             ckpt_dir,
             torch_dtype=torch_dtype,
@@ -176,6 +180,9 @@ def load_pretrained_model(
         # this will NOT load the adapter weights; it just
         # initializes the module so that they can be loaded later.
         model.get_model().initialize_adapter_modules(tune_mm_mlp_adapter=False, fsdp=None)
+    
+    else:
+        raise ValueError(f"Unsupported model type: {model_name}. Supported types: mosaicml/mpt, meta-llama")
 
     if sharded_ckpt:
         # Case: for sharded checkpoints, we need to manually load the

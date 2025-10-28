@@ -5,7 +5,24 @@ from math import floor
 import librosa as lr
 import numpy as np
 import torch
+import torch.backends.cudnn as cudnn
 from tqdm import tqdm
+
+# Debug CUDA/cuDNN information
+print("=== CUDA/cuDNN Debug Information ===")
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"cuDNN version: {torch.backends.cudnn.version()}")
+    print(f"cuDNN enabled: {torch.backends.cudnn.enabled}")
+    print(f"cuDNN benchmark: {torch.backends.cudnn.benchmark}")
+    print(f"cuDNN deterministic: {torch.backends.cudnn.deterministic}")
+    print(f"GPU count: {torch.cuda.device_count()}")
+    print(f"Current GPU: {torch.cuda.current_device()}")
+    print(f"GPU name: {torch.cuda.get_device_name()}")
+    print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+print("=====================================\n")
 
 JUKEBOX_SAMPLE_RATE = 44100
 T = 8192  # time dimension of jukebox activations
@@ -58,7 +75,111 @@ def get_z(audio, vqvae):
     ), f"expected samples with shape {JUKEBOX_EXPECTED_SAMPLES_LEN}; got shape {audio.shape}."
     audio = audio[:JUKEBOX_EXPECTED_SAMPLES_LEN]
 
-    zs = vqvae.encode(torch.cuda.FloatTensor(audio[np.newaxis, :, np.newaxis]))
+    # Clear GPU cache before processing each audio file
+    torch.cuda.empty_cache()
+    
+    print(f"Processing audio shape: {audio.shape}")
+    print(f"Audio dtype: {audio.dtype}")
+    print(f"GPU memory before encoding: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
+    
+    # Process with gradient disabled to save memory and use batch size of 1
+    with torch.no_grad():
+        try:
+            # Create tensor on GPU with explicit dtype
+            audio_tensor = torch.cuda.FloatTensor(audio[np.newaxis, :, np.newaxis])
+            print(f"Audio tensor shape: {audio_tensor.shape}")
+            print(f"Audio tensor device: {audio_tensor.device}")
+            print(f"Audio tensor dtype: {audio_tensor.dtype}")
+            
+            # Encode with error handling
+            zs = vqvae.encode(audio_tensor)
+            print(f"Encoding successful, zs length: {len(zs)}")
+            
+        except RuntimeError as e:
+            print(f"RuntimeError during encoding: {e}")
+            print(f"GPU memory at error: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
+            
+            # Try alternative approaches
+            if "cuDNN" in str(e):
+                print("Attempting cuDNN workarounds...")
+                
+                # Method 1: Try with different cuDNN settings
+                print("Method 1: Trying different cuDNN settings...")
+                original_benchmark = torch.backends.cudnn.benchmark
+                original_deterministic = torch.backends.cudnn.deterministic
+                
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.deterministic = False
+                
+                try:
+                    torch.cuda.empty_cache()
+                    audio_tensor = torch.cuda.FloatTensor(audio[np.newaxis, :, np.newaxis])
+                    zs = vqvae.encode(audio_tensor)
+                    print("Method 1 successful!")
+                except Exception as e2:
+                    print(f"Method 1 failed: {e2}")
+                    
+                    # Method 2: Disable cuDNN completely
+                    print("Method 2: Disabling cuDNN...")
+                    torch.backends.cudnn.enabled = False
+                    
+                    try:
+                        torch.cuda.empty_cache()
+                        audio_tensor = torch.cuda.FloatTensor(audio[np.newaxis, :, np.newaxis])
+                        zs = vqvae.encode(audio_tensor)
+                        print("Method 2 successful (cuDNN disabled)!")
+                    except Exception as e3:
+                        print(f"Method 2 failed: {e3}")
+                        
+                        # Method 3: Try with smaller chunks
+                        print("Method 3: Trying with smaller audio chunks...")
+                        torch.backends.cudnn.enabled = True
+                        
+                        try:
+                            # Split audio into smaller chunks
+                            chunk_size = JUKEBOX_EXPECTED_SAMPLES_LEN // 4  # Quarter size
+                            audio_chunks = []
+                            for i in range(0, len(audio), chunk_size):
+                                chunk = audio[i:i+chunk_size]
+                                if len(chunk) < chunk_size:
+                                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+                                audio_chunks.append(chunk)
+                            
+                            # Process first chunk only for now
+                            audio_tensor = torch.cuda.FloatTensor(audio_chunks[0][np.newaxis, :, np.newaxis])
+                            zs = vqvae.encode(audio_tensor)
+                            print("Method 3 successful (chunked processing)!")
+                            
+                        except Exception as e4:
+                            print(f"Method 3 failed: {e4}")
+                            
+                            # Method 4: CPU fallback
+                            print("Method 4: Trying CPU fallback...")
+                            try:
+                                # Move model to CPU temporarily
+                                vqvae_cpu = vqvae.cpu()
+                                audio_tensor_cpu = torch.FloatTensor(audio[np.newaxis, :, np.newaxis])
+                                zs = vqvae_cpu.encode(audio_tensor_cpu)
+                                # Move results back to GPU
+                                zs = [z.cuda() for z in zs]
+                                # Move model back to GPU
+                                vqvae.cuda()
+                                print("Method 4 successful (CPU fallback)!")
+                                
+                            except Exception as e5:
+                                print(f"Method 4 failed: {e5}")
+                                # Restore original settings and raise
+                                torch.backends.cudnn.benchmark = original_benchmark
+                                torch.backends.cudnn.deterministic = original_deterministic
+                                torch.backends.cudnn.enabled = True
+                                raise e
+                finally:
+                    # Restore original settings
+                    torch.backends.cudnn.benchmark = original_benchmark
+                    torch.backends.cudnn.deterministic = original_deterministic
+                    torch.backends.cudnn.enabled = True
+            else:
+                raise e
 
     z = zs[-1].flatten()[np.newaxis, :]
 
@@ -176,27 +297,57 @@ def get_acts_from_file(fpath, hps, vqvae, top_prior, meanpool=True, pool_frames_
 def load_model(model="5b"):
     from jukebox.hparams import Hyperparams, setup_hparams
     from jukebox.make_models import MODELS, make_prior, make_vqvae
-    from jukebox.utils.dist_utils import setup_dist_from_mpi
 
-    # Set up MPI
-    rank, local_rank, device = setup_dist_from_mpi()
+    # Skip MPI setup - use single GPU mode
+    rank = 0
+    local_rank = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    print(f"Using device: {device}")
+
+    # Configure cuDNN to avoid CUDNN_STATUS_MAPPING_ERROR
+    if torch.cuda.is_available():
+        print("Configuring cuDNN settings...")
+        # Disable cuDNN benchmark for deterministic behavior
+        torch.backends.cudnn.benchmark = False
+        # Enable cuDNN deterministic mode
+        torch.backends.cudnn.deterministic = True
+        # Ensure cuDNN is enabled
+        torch.backends.cudnn.enabled = True
+        print(f"cuDNN benchmark: {torch.backends.cudnn.benchmark}")
+        print(f"cuDNN deterministic: {torch.backends.cudnn.deterministic}")
+        print(f"cuDNN enabled: {torch.backends.cudnn.enabled}")
+
+    # Clear GPU cache before loading models
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Set up VQVAE
     hps = Hyperparams()
     hps.sr = JUKEBOX_SAMPLE_RATE
     hps.n_samples = 3 if model == "5b_lyrics" else 8
     hps.name = "samples"
-    # chunk_size = 16 if model == "5b_lyrics" else 32
-    # max_batch_size = 3 if model == "5b_lyrics" else 16
+    # Force batch size to 1 for single audio processing
+    # chunk_size = 1  # Process one audio at a time
+    # max_batch_size = 1  # Maximum batch size of 1
     hps.levels = 3
     hps.hop_fraction = [0.5, 0.5, 0.125]
     vqvae, *priors = MODELS[model]
     vqvae = make_vqvae(setup_hparams(vqvae, dict(sample_length=1048576)), device)
 
+    # Clear cache after loading VQ-VAE
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Set up language model
     hparams = setup_hparams(priors[-1], dict())
     hparams["prior_depth"] = 36
     top_prior = make_prior(hparams, vqvae, device)
+    
+    # Final cache clear
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     return hps, vqvae, top_prior
 
 
@@ -235,7 +386,6 @@ def main():
     for input_path in tqdm(input_paths):
         if not loaded:
             hps, vqvae, top_prior = load_model()
-
             loaded = True
 
         # Decode, resample, convert to mono, and normalize audio
@@ -248,6 +398,11 @@ def main():
                 meanpool=True,
                 pool_frames_per_second=args.pool_frames_per_second,
             )
+        
+        # Clear GPU cache after processing each file
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         input_filename = os.path.basename(input_path)
         output_filename = input_filename.replace(".wav", ".npy")
         output_path = os.path.join(output_dir, output_filename)

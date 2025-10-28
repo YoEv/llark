@@ -60,6 +60,12 @@ def main(
 
     model, tokenizer = load_pretrained_model(model_args.model_name_or_path, ckpt_num=ckpt_num)
 
+    # Fix tokenizer max_length to prevent overflow
+    if hasattr(tokenizer, 'model_max_length'):
+        original_max_length = tokenizer.model_max_length
+        print(f"[DEBUG] Changed tokenizer max_length from {original_max_length} to 512")
+        tokenizer.model_max_length = 512
+
     data_args.mm_use_audio_start_end = True
 
     end_seq = get_prompt_end_token_sequence(tokenizer, model_args.model_name_or_path)
@@ -142,12 +148,22 @@ if __name__ == "__main__":
         default="infer_results.csv",
         help="path to csv file to write results.",
     )
+    parser.add_argument(
+        "--model-max-length",
+        type=int,
+        default=2048,
+        help="Maximum sequence length for tokenization.",
+    )
     (
         model_args,
         data_args,
         training_args,
         other_args,
     ) = parser.parse_args_into_dataclasses()
+
+    # Set model_max_length if provided
+    if hasattr(other_args, 'model_max_length') and other_args.model_max_length:
+        training_args.model_max_length = other_args.model_max_length
 
     main(
         data_args=data_args,
